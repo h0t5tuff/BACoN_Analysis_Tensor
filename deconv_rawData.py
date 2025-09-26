@@ -13,6 +13,7 @@
 ### Modified on 13th June to include area around peaks too to see a core lation betweene height and area 
 ### correction to the code on 19thAug' Added an area calc in deconv wf too so that only take peaks which have a certain peak height AND area ( will help in removing erreneous spikes that arise from FFT-IFFT)
 
+### Modified on 25th Sept, re did conv/deconv with linear rfft instead of circular FFT , made renormalizing easier and better
 
 
 import sys
@@ -36,6 +37,7 @@ from scipy.signal import wiener
 from scipy.signal import deconvolve
 from scipy.signal import savgol_filter
 from scipy.signal import find_peaks
+from scipy.signal.windows import tukey
 from scipy.integrate import cumulative_trapezoid
 from scipy.optimize import approx_fprime
 
@@ -74,13 +76,33 @@ while channel < 12:
     isolated_spe_wf_averaged = np.zeros(300, dtype=int)
     isolated_spe_wf_averaged = np.loadtxt(infile_template)       ## this is the template signal
 
+    n = 7500
+    
+
     # dy_dt_template = computeDerivative(isolated_spe_wf_averaged, x1_values)
     template_clean = savgol_filter(isolated_spe_wf_averaged, 65,5)      #smooth out template signal
+
+
     x1_values = np.arange(0, len(isolated_spe_wf_averaged))
     # dy_dt_template = np.gradient(template_clean, x1_values)       ## if want derivative
     dy_dt_template = template_clean         ##don't want derivative
 
+    template_time = dy_dt_template
+    m = len(template_time)
 
+    ###trying linear convolution instead of circular
+    N = 1 << (n + m - 1 - 1).bit_length()
+
+    # Zero-pad template to N and take rFFT (not numpy.fft) (real FFT is a bit faster/cleaner)
+    T = np.fft.rfft(np.pad(template_time, (0, N - m)))
+
+    # Wiener-style inverse (stabilizes where |T| is small)
+    lam = 1e-2 * np.max(np.abs(T)**2)             # start around 1% of peak |T|^2 (tune if needed)
+    Hinv = np.conj(T) / (np.abs(T)**2 + lam)      # Wiener inverse filter
+
+    # Band-select mask: only bins where template has decent gain
+    magT = np.abs(T)
+    mask = magT > np.percentile(magT, 30)         # keep top 70% by |T| (tune 10–50%)
 
     # # template signal plotting
     # plt.figure(1)
@@ -183,11 +205,11 @@ while channel < 12:
             event_elim_threshold = 1500                                     ### 10*1PE value
 
         
-        Vth_signal_nontrigger = 31.0     ##this is threshold for signal detection in derivative of deconv or just deconv
-        seperation = 15             ### minimum separation allowed between peaks to be recognized
+        Vth_signal_nontrigger = 145.0     ##this is threshold for signal detection in derivative of deconv or just deconv
+        seperation = 10             ### minimum separation allowed between peaks to be recognized
 
-        Vth_signal_trigger = 38.0     ##this is threshold for signal detection in derivative of deconv or just deconv
-        seperation = 15             ### minimum separation allowed between peaks to be recognized
+        Vth_signal_trigger = 745.0     ##this is threshold for signal detection in derivative of deconv or just deconv
+        seperation = 10             ### minimum separation allowed between peaks to be recognized
 
 
         with open(outfile, 'a') as file:
@@ -205,35 +227,51 @@ while channel < 12:
                 # dy_dt = np.gradient(obs_signal_clean, x2_values)      ### uncomment if want to work with derivative
                 dy_dt = obs_signal_clean
 
-                obs_signal_fft = fft(dy_dt)
+                # Light endpoint taper to reduce edge splash; preserves central region
+                x = dy_dt * tukey(len(dy_dt), alpha=0.1)
                 
+                # Zero-pad observation to N and rFFT
+                X = np.fft.rfft(np.pad(x, (0, N - len(x))))
                 
-                fft_deconv = (obs_signal_fft)/(template_signal_fft + 1e-8)      # adding a small number to avoid  accidental division by zero
-                deconv_wf = np.real(ifft(fft_deconv))
-                ### renormalizing:
-                observed_signal_energy = np.sum(np.abs(dy_dt)**2)
-                estimated_signal_energy = np.sum(np.abs(deconv_wf)**2)
-                scaling_factor = 1000.0   ##np.sqrt(observed_signal_energy / estimated_signal_energy)
-                deconv_wf = deconv_wf*scaling_factor
+                # Wiener deconvolution in freq domain (stable inverse)
+                S_hat_fft = X * Hinv
+                #irFFT to time domain; length N
+                s_hat_full = np.fft.irfft(S_hat_fft, n=N)
                 
-                deconv_wf = wiener(deconv_wf, mysize=50, noise=None)        ###trying filtering on the deconved result
+                # Crop the valid (linear) segment of length n starting at m-1
+                 
+                start = m - 1
+                end   = start + n
+                
+                deconv_wf = s_hat_full[start:end]
+                
+                # ---  denoise ---
+                deconv_wf = wiener(deconv_wf, mysize=50, noise=None)  ###trying filtering on the deconved result
+                
                 deconv_wf = savgol_filter(deconv_wf, 65, 5)
-                # reconstructed_wf = computeIntegral(x2_values, deconv_wf, initial_value=deconv_wf[0])
-                # reconstructed_wf = cumulative_trapezoid(deconv_wf, x2_values, initial=0)
-
-
-                ###correcting for time shift in deconv data
-                # delta_t = 1    
-                # # Cross-correlation to find the time shift
-                # correlation = correlate(deconv_wf, isolated_spe_wf_averaged, mode='full')
-                # lag = np.argmax(correlation) - (len(isolated_spe_wf_averaged) - 1)
-                # time_shift = lag * delta_t
-
-                # # Correct the time shift
-                # corrected_time = np.arange(len(deconvolved_signal)) * delta_t - time_shift
 
                 
-                # deconv_wf = np.roll(deconv_wf, 50)          ##to adjust for time shift in deconv
+
+
+
+                deconv_wf = wiener(deconv_wf, mysize=50, noise=None)        
+                deconv_wf = savgol_filter(deconv_wf, 65, 5)
+
+
+                # --- Band-limited energy scaling (robust to out-of-band noise) ---
+                # Using the same frequency mask built from the template.
+                # Compute energies on the *padded* frequency-domain vectors:
+                 
+                D = X                                      # obs spectrum (padded)
+                S = S_hat_fft                              # deconv spectrum (padded)
+                num = np.sum(np.abs(D[mask])**2)
+                den = np.sum(np.abs(S[mask])**2) + 1e-12        ##add a small number so fraction doesnt blow up
+                scaling_factor = np.sqrt(num / den)        # band-limited RMS match
+                
+                deconv_wf *= scaling_factor
+          
+
+
 
                 
                 if (channel == 9 or channel == 10 or channel == 11):
@@ -266,16 +304,19 @@ while channel < 12:
 
 
 
+                # Need to correct offset as deconvolved peaks are ~350 samples behind
+                offset = 350   
+
+                corrected_peaks = [p + offset for p in final_peaks]
                 
-                ## add one more filter that area in deconved peaks should be > 500 
-                str1 = ','.join(map(str, final_peaks))
+                str1 = ','.join(map(str, corrected_peaks))        ##time peaks are 350 samples behind the actual peak
                 str2 = ','.join(map(str, final_heights))
                 str3 = ','.join(map(str, final_areas))
                 file.write(f"[{i}]\t[{str1}]\t[{str2}]\t[{str3}]\n")  ###format is [event number] [time stamps of peaks] [height of peaks in deconved wf] [area in those deconv wf]
 
 
             
-                # if i == 64  or i == 65 : # or i == 20 :
+                # if i < 4: ## == 9  or i == 13 or i == 14 or i == 17 :
                 #     plt.figure()
                 #     plt.plot(x2_values, obs_signal, marker='o', color = 'r', label = f"Observed signal-{channel}-{i}")
                 #     plt.plot(x2_values, dy_dt, marker='o',  color = 'g', label = "After smoothing")
